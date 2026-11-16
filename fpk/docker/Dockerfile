@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnotify4 \
     gnome-keyring \
     dbus-x11 \
-    dbus-launch \
     xvfb \
     x11vnc \
     novnc \
