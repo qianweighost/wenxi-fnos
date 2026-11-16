@@ -52,7 +52,7 @@ jobs:
       - name: Generate Linux platform scaffolding
         run: flutter create --platforms=linux --project-name asterlink .
       - name: Pub get
-        run: flutter pub get
+        run: flutter pub get --enforce-lockfile
       - name: Build Linux release
         run: flutter build linux --release
       - name: Download Go helper artifact
