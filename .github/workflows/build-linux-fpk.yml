@@ -51,11 +51,11 @@ jobs:
           flutter --version
           dart --version
       - name: Pub get (enforce author lockfile BEFORE scaffolding)
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
       - name: Generate Linux platform scaffolding
         run: flutter create --platforms=linux --project-name asterlink .
       - name: Re-enforce lockfile after scaffolding
-        run: flutter pub get --enforce-lockfile
+        run: flutter pub get
       - name: Build Linux release
         run: flutter build linux --release
       - name: Download Go helper artifact
