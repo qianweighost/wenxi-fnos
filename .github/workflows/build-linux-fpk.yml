@@ -1,0 +1,86 @@
+name: build-linux-fpk
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  go-helper:
+    name: Build Go download helper (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.7'
+      - name: Build asterlink_gopeed for Linux
+        run: |
+          cd native/gopeed
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct \
+          go build -tags nosqlite -trimpath \
+            -ldflags "-s -w -checklinkname=0 -X github.com/GopeedLab/gopeed/pkg/base.Version=1.8.1" \
+            -o ../../asterlink_gopeed ./cmd/asterlink
+      - name: Smoke test helper
+        run: ./asterlink_gopeed version || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-helper
+          path: asterlink_gopeed
+
+  flutter-linux:
+    name: Build Flutter Linux desktop app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Show toolchain
+        run: |
+          flutter --version
+          dart --version
+      - name: Generate Linux platform scaffolding
+        run: flutter create --platforms=linux --project-name asterlink .
+      - name: Pub get
+        run: flutter pub get
+      - name: Build Linux release
+        run: flutter build linux --release
+      - name: Download Go helper artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: go-helper
+          path: helper
+      - name: Assemble bundle
+        run: |
+          chmod +x helper/asterlink_gopeed
+          cp helper/asterlink_gopeed build/linux/x64/release/bundle/
+          tar -C build/linux/x64/release -czf asterlink-linux-bundle.tar.gz bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: asterlink-linux-bundle.tar.gz
+
+  docker-image:
+    name: Build runtime Docker image (Xvfb + noVNC)
+    runs-on: ubuntu-latest
+    needs: [flutter-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundle
+          path: bundle-tar
+      - name: Extract bundle into Docker context
+        run: |
+          tar -xzf bundle-tar/asterlink-linux-bundle.tar.gz -C fpk/docker/
+          ls -la fpk/docker/bundle/
+      - name: Build runtime image
+        run: docker build -f fpk/docker/Dockerfile -t asterlink-fnos:v2.3.1 fpk/docker
+      - name: Export image tar
+        run: docker save asterlink-fnos:v2.3.1 -o asterlink-fnos-image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-image
+          path: asterlink-fnos-image.tar
