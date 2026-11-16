@@ -1,0 +1,455 @@
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+import zipfile
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'tool' / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+public = load('public_files', 'check_public_files.py')
+release = load('release_assets', 'package-release.py')
+settings = load('release_settings', 'prepare-ci-release.py')
+arm64_lock = load('arm64_lock', 'prepare-windows-arm64-lock.py')
+
+BACKEND_ONLY_PATHS = [
+    'backend/src/Routes.php', 'wwwroot/5.com/src/Sources.php',
+    '5.com/config/local.php', '.claude/settings.local.json',
+    'tool/password_updater/updater.py',
+    'tool/password_updater/templates/index.html',
+    '\u542f\u52a8\u5bc6\u7801\u66f4\u65b0\u5668.cmd',
+    'tool/source_runner.dart', 'tool/build-source-runtime.ps1',
+    'tool/tests/source_live_smoke.dart',
+    'docs/SOURCE-RUNTIME-DEPLOYMENT.md',
+    'docs/REMOTE-SOURCE-VERIFICATION.md',
+]
+
+
+class PublicFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name) / 'source'
+        self.root.mkdir()
+        (self.root / '.gitignore').write_text('/logs/\n/.local/\n', encoding='utf-8')
+        (self.root / 'main.dart').write_text('void main() {}\n', encoding='utf-8')
+
+    def test_private_backups_are_excluded_from_export(self):
+        (self.root / 'logs').mkdir()
+        (self.root / 'logs/account-backup-1.json').write_text('{}', encoding='utf-8')
+        target = self.root.parent / 'public'
+        report = public.check(self.root, export=target)
+        self.assertTrue(report['passed'])
+        self.assertTrue((target / 'main.dart').is_file())
+        self.assertFalse((target / 'logs').exists())
+        self.assertFalse((self.root / '.git').exists())
+
+    def test_misplaced_backup_is_rejected_without_exporting(self):
+        (self.root / 'app-backup-42.json').write_text('{}', encoding='utf-8')
+        report = public.check(self.root)
+        self.assertFalse(report['passed'])
+        target = self.root.parent / 'public'
+        with self.assertRaises(ValueError):
+            public.check(self.root, export=target)
+        self.assertFalse(target.exists())
+
+    def test_renamed_encrypted_account_backup_is_rejected(self):
+        (self.root / 'sample.json').write_text(json.dumps({
+            'format': 'asterlink-backup-v1', 'ciphertext': 'synthetic-data',
+        }), encoding='utf-8')
+        report = public.check(self.root)
+        self.assertFalse(report['passed'])
+        self.assertIn('account-backup-content', [item['rule'] for item in report['findings']])
+
+    def test_staged_blob_is_checked_even_when_working_copy_is_clean(self):
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
+        secret = 'gh' + 'p_' + 'A1b2' * 10
+        (self.root / 'config.txt').write_text(secret, encoding='utf-8')
+        subprocess.run(['git', '-C', str(self.root), 'add', '.'], check=True)
+        (self.root / 'config.txt').write_text('clean working copy', encoding='utf-8')
+        report = public.check(self.root, staged=True)
+        self.assertFalse(report['passed'])
+        self.assertIn('github-token', [item['rule'] for item in report['findings']])
+        self.assertNotIn(secret, json.dumps(report))
+
+    def test_reviewed_backup_vector_requires_explicit_rule_and_exact_hash(self):
+        path = 'test/fixtures/compatibility.json'
+        fixture = self.root / path
+        fixture.parent.mkdir(parents=True)
+        data = b'{"format":"wenxi-backup-v1","data":"synthetic"}\n'
+        fixture.write_bytes(data)
+        (self.root / 'tool').mkdir()
+        allowlist = self.root / 'tool/public-fixtures.json'
+        review = {'sha256': hashlib.sha256(data).hexdigest(), 'reason': 'synthetic vector'}
+        allowlist.write_text(json.dumps({path: review}), encoding='utf-8')
+        self.assertFalse(public.check(self.root)['passed'])
+        review['rules'] = ['account-backup-content']
+        allowlist.write_text(json.dumps({path: review}), encoding='utf-8')
+        self.assertTrue(public.check(self.root)['passed'])
+        fixture.write_bytes(data.replace(b'synthetic', b'changed'))
+        self.assertFalse(public.check(self.root)['passed'])
+        fixture.write_bytes(data)
+        (self.root / 'renamed.json').write_bytes(data)
+        self.assertFalse(public.check(self.root)['passed'])
+
+    def test_ignored_but_already_tracked_backup_is_rejected(self):
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
+        (self.root / 'logs').mkdir()
+        (self.root / 'logs/accounts.json').write_text('{}', encoding='utf-8')
+        subprocess.run(['git', '-C', str(self.root), 'add', '-f', 'logs/accounts.json'], check=True)
+        self.assertFalse(public.check(self.root, staged=True)['passed'])
+
+    def test_repository_rules_keep_local_tools_out_of_public_export(self):
+        shutil.copy2(ROOT / '.gitignore', self.root / '.gitignore')
+        private_paths = BACKEND_ONLY_PATHS + [
+            '\u516c\u544a\u7f16\u8f91\u5668.html',
+            'tool/announcement-editor.test.cjs', 'announcements.json',
+            'config-1.7.0.json', 'config-2.0.0.json', '\u4ea4\u4e92.txt',
+            'docs/CLOUD-PROVIDERS-2026-09-24.md',
+            'docs/OPENLIST-CLOUDS-SMS-2026-09-24.md',
+            'docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md',
+            'native/gopeed/internal/protocol/http/build.data',
+            'native/gopeed/internal/protocol/http/download.data',
+            'outputs/player-tests.txt', 'outputs/task.network-response',
+            'dist/verification.json', 'dist/SHA256SUMS.txt',
+            'tool/DISK_CLEANUP_PANEL.md', 'tool/disk_cleanup_panel.py',
+            'tool/run_disk_cleanup_panel.cmd',
+            'setup.exe', 'app-release.apk', 'download.zip', 'capture.har',
+        ]
+        public_paths = [
+            'config/announcements.example.json', 'docs/ANNOUNCEMENTS.md',
+            'lib/domain/announcements.dart', 'docs/images/promo-android.png',
+            'lib/data/parser_rules/server.dart', 'lib/data/sources/runtime.dart',
+            'lib/lan/lan_server.dart', 'native/gopeed/pkg/rest/server.go',
+            'vendor_plugins/asterlink_js/src/asterlink_js.c',
+            'docs/REMOTE-SOURCE-ARCHITECTURE.md', 'docs/REMOTE-SOURCE-SDK.md',
+            'docs/PARSER-RULES.md', 'config/parser-hub.example.json',
+            '\u8fdc\u7a0b\u914d\u7f6e\u7f16\u8f91\u5668.html',
+            'tool/remote-control-editor.test.cjs',
+            'native/third_party/libmpv-android-build-v1.1.7.zip',
+        ]
+        for name in private_paths + public_paths:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('synthetic fixture\n', encoding='utf-8')
+        target = self.root.parent / 'public'
+        self.assertTrue(public.check(self.root, export=target)['passed'])
+        for name in private_paths:
+            with self.subTest(private_path=name):
+                self.assertFalse((target / name).exists())
+                self.assertTrue((self.root / name).is_file())
+        for name in public_paths:
+            with self.subTest(public_path=name):
+                self.assertTrue((target / name).is_file())
+
+    def test_force_added_local_tools_are_rejected_by_staged_check(self):
+        subprocess.run(['git', 'init', '--quiet', str(self.root)], check=True)
+        shutil.copy2(ROOT / '.gitignore', self.root / '.gitignore')
+        paths = BACKEND_ONLY_PATHS + [
+            '\u516c\u544a\u7f16\u8f91\u5668.html',
+            'tool/announcement-editor.test.cjs', 'announcements.json',
+            'config-1.7.0.json', '\u4ea4\u4e92.txt',
+            'docs/QUARK-AUTHENTICATED-DIRECT-DOWNLOAD.md',
+            'setup.exe', 'download.zip', 'capture.har',
+            'native/gopeed/internal/protocol/http/download.data',
+            'outputs/player-tests.txt', 'outputs/task.network-response',
+            'dist/verification.json', 'dist/SHA256SUMS.txt',
+            'tool/DISK_CLEANUP_PANEL.md', 'tool/disk_cleanup_panel.py',
+            'tool/run_disk_cleanup_panel.cmd',
+        ]
+        for name in paths:
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('synthetic fixture\n', encoding='utf-8')
+        subprocess.run(['git', '-C', str(self.root), 'add', '-f', '--', *paths], check=True)
+        report = public.check(self.root, staged=True)
+        self.assertFalse(report['passed'])
+        self.assertEqual({item['path'] for item in report['findings']}, set(paths))
+
+    def test_reviewed_fixture_is_bound_to_its_hash(self):
+        (self.root / 'tool').mkdir()
+        data = b'-----BEGIN ' + b'PRIVATE KEY-----\nsynthetic\n'
+        fixture = self.root / 'fixture.txt'
+        fixture.write_bytes(data)
+        (self.root / 'tool/public-fixtures.json').write_text(json.dumps({
+            'fixture.txt': {'sha256': hashlib.sha256(data).hexdigest(), 'reason': 'synthetic test'},
+        }), encoding='utf-8')
+        self.assertTrue(public.check(self.root)['passed'])
+        fixture.write_bytes(data.replace(b'\n', b'\r\n'))
+        self.assertTrue(public.check(self.root)['passed'])
+        fixture.write_bytes(data + b'changed')
+        self.assertFalse(public.check(self.root)['passed'])
+
+    def test_existing_export_directory_is_never_overwritten(self):
+        target = self.root.parent / 'public'
+        target.mkdir()
+        (target / 'keep.txt').write_text('keep', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            public.check(self.root, export=target)
+        self.assertEqual((target / 'keep.txt').read_text(encoding='utf-8'), 'keep')
+
+
+class ReleaseFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / 'pubspec.yaml').write_text('version: 1.2.3+4\n', encoding='utf-8')
+
+    def player_extractor(self, runtime):
+        extractor = runtime / 'tools/player-7za.exe'
+        extractor.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / 'native/third_party/player-7za-x64-26.01.bin', extractor)
+        return extractor
+
+    def test_apk_name_and_checksum_include_the_build_number(self):
+        apk = self.root / 'build/app/outputs/flutter-apk/app-release.apk'
+        apk.parent.mkdir(parents=True)
+        apk.write_bytes(b'synthetic-apk')
+        output = release.stage(self.root, 'android')
+        self.assertEqual(release.checksums(output), 1)
+        expected = hashlib.sha256(b'synthetic-apk').hexdigest()
+        self.assertEqual((output / 'SHA256SUMS.txt').read_text(encoding='utf-8'),
+                         expected + '  asterlink-1.2.3+4-android-arm64.apk\n')
+        with self.assertRaises(ValueError):
+            release.stage(self.root, 'android')
+
+    def test_portable_archive_preserves_the_complete_runtime_layout(self):
+        runtime = self.root / 'build/windows/x64/runner/Release'
+        for name in ('asterlink.exe', 'asterlink_gopeed.exe', 'flutter_windows.dll', 'libmpv-2.dll', 'data/app.so'):
+            file = runtime / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'fixture')
+        self.player_extractor(runtime)
+        output = release.stage(self.root, 'windows')
+        with zipfile.ZipFile(output / 'asterlink-1.2.3+4-windows-x64.zip') as archive:
+            self.assertIn('data/app.so', archive.namelist())
+            self.assertIn('asterlink_gopeed.exe', archive.namelist())
+            self.assertEqual(hashlib.sha256(archive.read('tools/player-7za.exe')).hexdigest(),
+                             '5bea5af5215089d97749d438351d7288310d0b8a472616edbe1b34168ad1001c')
+            self.assertFalse(any(name.startswith('Release/') for name in archive.namelist()))
+
+    def test_runtime_with_private_key_is_rejected(self):
+        runtime = self.root / 'build/windows/x64/runner/Release'
+        for name in ('asterlink.exe', 'asterlink_gopeed.exe', 'flutter_windows.dll', 'libmpv-2.dll', 'data/app.so', 'private.jks'):
+            file = runtime / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'fixture')
+        self.player_extractor(runtime)
+        with self.assertRaises(ValueError):
+            release.stage(self.root, 'windows')
+
+    def test_windows_architectures_stage_distinct_runtimes_and_installers(self):
+        for architecture in ('x64', 'arm64'):
+            runtime = self.root / ('build/windows/' + architecture + '/runner/Release')
+            for name in ('asterlink.exe', 'asterlink_gopeed.exe', 'flutter_windows.dll', 'libmpv-2.dll', 'data/app.so'):
+                file = runtime / name
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(architecture.encode())
+            if architecture == 'x64':
+                self.player_extractor(runtime)
+            installer = self.root / (architecture + '-setup.exe')
+            installer.write_bytes(architecture.encode())
+            output = release.stage(self.root, 'windows', installer, architecture)
+            with zipfile.ZipFile(output / ('asterlink-1.2.3+4-windows-' + architecture + '.zip')) as archive:
+                self.assertEqual(archive.read('asterlink.exe'), architecture.encode())
+            self.assertEqual((output / ('asterlink-1.2.3+4-windows-' + architecture + '-setup.exe')).read_bytes(), architecture.encode())
+        self.assertEqual(release.checksums(output), 4)
+
+    def test_missing_or_corrupt_player_extractor_prevents_x64_publication(self):
+        runtime = self.root / 'build/windows/x64/runner/Release'
+        for name in ('asterlink.exe', 'asterlink_gopeed.exe', 'flutter_windows.dll', 'libmpv-2.dll', 'data/app.so'):
+            file = runtime / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'fixture')
+        with self.assertRaisesRegex(ValueError, 'missing the player component extractor'):
+            release.stage(self.root, 'windows')
+        extractor = self.player_extractor(runtime)
+        with extractor.open('r+b') as stream:
+            stream.seek(128)
+            stream.write(b'corrupt')
+        with self.assertRaisesRegex(ValueError, 'extractor did not verify'):
+            release.stage(self.root, 'windows')
+        self.assertFalse((self.root / '.local/release-assets/asterlink-1.2.3+4-windows-x64.zip').exists())
+
+    def test_invalid_architecture_is_rejected_before_staging(self):
+        with self.assertRaises(ValueError):
+            release.stage(self.root, 'windows', architecture='../other')
+        self.assertFalse((self.root / '.local').exists())
+
+
+class Arm64LockTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.sdk = self.root / 'sdk'
+        (self.sdk / 'bin/internal').mkdir(parents=True)
+        (self.sdk / 'bin/internal/engine.version').write_text(arm64_lock.ENGINE, encoding='utf-8')
+        self.path = self.root / 'pubspec.lock'
+        self.original = (ROOT / 'pubspec.lock').read_bytes()
+        self.path.write_bytes(self.original)
+
+    def test_only_sdk_companion_blocks_change_and_reapplying_is_stable(self):
+        arm64_lock.prepare(self.root, self.sdk)
+        adapted = self.path.read_bytes()
+        def other_blocks(data):
+            text = data.decode('utf-8').replace('\r\n', '\n')
+            for name in arm64_lock.PACKAGES:
+                text = __import__('re').sub(r'(?m)^  ' + name + r':\n(?:(?:    .*|)\n)+', '', text)
+            return text
+        self.assertEqual(other_blocks(adapted), other_blocks(self.original))
+        arm64_lock.prepare(self.root, self.sdk)
+        self.assertEqual(self.path.read_bytes(), adapted)
+        self.assertIn(b'version: "4.10.1"', adapted)
+
+    def test_wrong_engine_and_package_source_preserve_the_lock(self):
+        (self.sdk / 'bin/internal/engine.version').write_text('other-engine', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            arm64_lock.prepare(self.root, self.sdk)
+        self.assertEqual(self.path.read_bytes(), self.original)
+        (self.sdk / 'bin/internal/engine.version').write_text(arm64_lock.ENGINE, encoding='utf-8')
+        invalid = self.original.replace(b'pub.flutter-io.cn', b'packages.invalid').replace(b'pub.dev', b'packages.invalid')
+        self.path.write_bytes(invalid)
+        with self.assertRaises(ValueError):
+            arm64_lock.prepare(self.root, self.sdk)
+        self.assertEqual(self.path.read_bytes(), invalid)
+
+    def test_official_registry_keeps_sources_and_non_sdk_packages(self):
+        official = self.original.replace(b'pub.flutter-io.cn', b'pub.dev')
+        self.path.write_bytes(official)
+        arm64_lock.prepare(self.root, self.sdk)
+        adapted = self.path.read_bytes()
+        def other_blocks(data):
+            text = data.decode('utf-8').replace('\r\n', '\n')
+            for name in arm64_lock.PACKAGES:
+                text = __import__('re').sub(r'(?m)^  ' + name + r':\n(?:(?:    .*|)\n)+', '', text)
+            return text
+        self.assertEqual(other_blocks(adapted), other_blocks(official))
+        self.assertNotIn(b'pub.flutter-io.cn', adapted)
+        self.assertIn(b'url: "https://pub.dev"', adapted)
+        arm64_lock.prepare(self.root, self.sdk)
+        self.assertEqual(self.path.read_bytes(), adapted)
+
+
+class SigningSettingsTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        (self.root / 'config').mkdir()
+        shutil.copy2(ROOT / 'config/build.community.json', self.root / 'config/build.community.json')
+
+    def test_missing_secrets_do_not_write_partial_signing_files(self):
+        with self.assertRaises(ValueError):
+            settings.prepare(self.root, True, {})
+        self.assertFalse((self.root / '.local').exists())
+
+    def test_existing_local_settings_are_not_replaced(self):
+        (self.root / '.local').mkdir()
+        config = self.root / '.local/build-config.json'
+        config.write_text('{"local":true}', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            settings.prepare(self.root, environment={})
+        self.assertEqual(config.read_text(encoding='utf-8'), '{"local":true}')
+
+    def test_client_defines_are_restored_without_exposing_them_in_build_settings(self):
+        files = {'cloud-command.defines.json': {
+            'ASTERLINK_QUARK_COMMAND_KEY': 'fixture-quark',
+            'ASTERLINK_UC_COMMAND_KEY': 'fixture-uc',
+        }}
+        settings.prepare(self.root, environment={'ASTERLINK_CLIENT_DEFINES_JSON': json.dumps(files)})
+        local = self.root / '.local'
+        self.assertEqual(json.loads((local / 'cloud-command.defines.json').read_text()),
+                         files['cloud-command.defines.json'])
+        self.assertNotIn('fixture-quark', (local / 'build-config.json').read_text())
+
+    def test_unknown_files_fields_and_non_string_values_are_rejected_before_writing(self):
+        invalid = [
+            {'../outside.json': {}},
+            {'cloud-command.defines.json': {'ADMIN_PASSWORD': 'synthetic'}},
+            {'cloud-command.defines.json': {
+                'ASTERLINK_QUARK_COMMAND_KEY': 123, 'ASTERLINK_UC_COMMAND_KEY': 'fixture',
+            }},
+            ['cloud-command.defines.json'],
+        ]
+        for files in invalid:
+            with self.subTest(files=files), self.assertRaises(ValueError):
+                settings.prepare(self.root, environment={'ASTERLINK_CLIENT_DEFINES_JSON': json.dumps(files)})
+            self.assertFalse((self.root / '.local').exists())
+
+    def test_malformed_client_config_error_does_not_echo_secret_values(self):
+        with self.assertRaises(ValueError) as error:
+            settings.prepare(self.root, environment={'ASTERLINK_CLIENT_DEFINES_JSON': 'synthetic-private-data'})
+        self.assertNotIn('synthetic-private-data', str(error.exception))
+        self.assertFalse((self.root / '.local').exists())
+
+    def test_existing_client_config_is_not_overwritten(self):
+        local = self.root / '.local'
+        local.mkdir()
+        defines = local / 'cloud-command.defines.json'
+        defines.write_text('{"local":true}', encoding='utf-8')
+        files = {'cloud-command.defines.json': {
+            'ASTERLINK_QUARK_COMMAND_KEY': 'fixture-quark', 'ASTERLINK_UC_COMMAND_KEY': 'fixture-uc',
+        }}
+        with self.assertRaises(ValueError):
+            settings.prepare(self.root, environment={'ASTERLINK_CLIENT_DEFINES_JSON': json.dumps(files)})
+        self.assertEqual(defines.read_text(), '{"local":true}')
+        self.assertFalse((local / 'build-config.json').exists())
+
+    def test_properties_escape_metacharacters_and_keep_secrets_out_of_config(self):
+        env = {
+            'ANDROID_KEYSTORE_BASE64': base64.b64encode(b'synthetic-keystore').decode(),
+            'ANDROID_KEYSTORE_PASSWORD': 'space and=colon:\\line\nnext',
+            'ANDROID_KEY_ALIAS': 'test-key',
+            'ANDROID_KEY_PASSWORD': 'test-password',
+            'GITHUB_REPOSITORY': 'example/project',
+        }
+        settings.prepare(self.root, True, env)
+        config = (self.root / '.local/build-config.json').read_text(encoding='utf-8')
+        properties = (self.root / '.local/keystore.properties').read_text(encoding='ascii')
+        self.assertEqual(len(properties.splitlines()), 4)
+        self.assertIn('\\nnext', properties)
+        self.assertIn('\\=', properties)
+        self.assertNotIn(env['ANDROID_KEY_PASSWORD'], config)
+        self.assertEqual((self.root / '.local/ci-release.jks').read_bytes(), b'synthetic-keystore')
+        self.assertEqual(json.loads(config)['githubRepository'], 'example/project')
+
+
+@unittest.skipUnless(shutil.which('dart'), 'Dart SDK is required for version generation checks')
+class VersionTest(unittest.TestCase):
+    def test_generation_drift_and_release_tag_are_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'tool').mkdir()
+            shutil.copy2(ROOT / 'tool/sync_version.dart', root / 'tool/sync_version.dart')
+            pubspec = root / 'pubspec.yaml'
+            pubspec.write_text('version: 1.2.3+4\n', encoding='utf-8')
+
+            def run(*args):
+                return subprocess.run([shutil.which('dart'), str(root / 'tool/sync_version.dart'), *args],
+                                      cwd=root, capture_output=True, text=True)
+
+            self.assertNotEqual(run('--check').returncode, 0)
+            self.assertEqual(run('--write').returncode, 0)
+            self.assertEqual(run('--check', '--tag', 'v1.2.3+4').returncode, 0)
+            self.assertNotEqual(run('--check', '--tag', 'v1.2.3+3').returncode, 0)
+            pubspec.write_text('version: 1.2.3+5\n', encoding='utf-8')
+            self.assertNotEqual(run('--check').returncode, 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

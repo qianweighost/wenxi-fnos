@@ -1,0 +1,28 @@
+{
+  "announcements": [
+    {
+      "id": "notice-001",
+      "title": "软件使用公告",
+      "content": "## 使用提示\n\n**软件完全免费**，支持手机和电脑。\n\n1. 进入解析页查看消息公告\n2. 点击消息阅读完整内容\n\n> 遇到问题时，请提供设备信息和脱敏日志。\n\n---\n\n[访问项目](https://github.com/z7786/wenxi)",
+      "publishedAt": "2026-10-10T08:00:00+08:00",
+      "pinned": true,
+      "enabled": true
+    },
+    {
+      "id": "notice-002",
+      "title": "问题反馈",
+      "content": "遇到问题时，请提供问题描述和脱敏日志。",
+      "publishedAt": "2026-10-09T18:00:00+08:00",
+      "buttonText": "前往反馈",
+      "buttonUrl": "https://github.com/z7786/wenxi/issues"
+    },
+    {
+      "id": "notice-mini-program-example",
+      "title": "图片与小程序按钮示例",
+      "content": "请将图片地址和微信跳转链接换成真实值后再启用。\n\n![活动图片](https://example.com/notice.png)",
+      "enabled": false,
+      "buttonText": "打开微信小程序",
+      "buttonUrl": "weixin://dl/business/?t=REPLACE_WITH_REAL_TICKET"
+    }
+  ]
+}
