@@ -31,7 +31,7 @@ jobs:
 
   flutter-linux:
     name: Build Flutter Linux desktop app
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux build dependencies
